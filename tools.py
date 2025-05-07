@@ -56,8 +56,9 @@ class TimeRecording:
 
 class Logger:
     def __init__(self, logdir, step):
-        self._logdir = logdir
-        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+        # ensure logdir is a Path
+        self._logdir = pathlib.Path(logdir)
+        self._writer = SummaryWriter(log_dir=str(self._logdir), max_queue=1000)
         self._last_step = None
         self._last_time = None
         self._scalars = {}
@@ -150,22 +151,31 @@ def simulate(
     while (steps and step < steps) or (episodes and episode < episodes):
         # reset envs if necessary
         if done.any():
-            indices = [index for index, d in enumerate(done) if d]
+            indices = [i for i, d in enumerate(done) if d]
+            # call reset() thunks
             results = [envs[i].reset() for i in indices]
             results = [r() for r in results]
             for index, result in zip(indices, results):
-                t = result.copy()
-                t = {k: convert(v) for k, v in t.items()}
+                # Gymnasium reset returns (obs, info), Gym returns obs
+                if isinstance(result, tuple) and len(result) == 2:
+                    obs_reset, info_reset = result
+                else:
+                    obs_reset, info_reset = result, {}
+                # obs_reset should be a dict (or wrap it)
+                t = obs_reset.copy() if isinstance(obs_reset, dict) else {"state": obs_reset}
                 # action will be added to transition in add_to_cache
                 t["reward"] = 0.0
                 t["discount"] = 1.0
-                # initial state should be added to cache
+                # mark episode‐start
+                t["is_first"]    = True
+                t["is_terminal"] = False
                 add_to_cache(cache, envs[index].id, t)
-                # replace obs with done by initial state
-                obs[index] = result
+                # replace obs with the reset transition so it carries flags
+                obs[index] = t
+
         # step agents
-        obs = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
-        action, agent_state = agent(obs, done, agent_state)
+        obs_input = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
+        action, agent_state = agent(obs_input, done, agent_state)
         if isinstance(action, dict):
             action = [
                 {k: np.array(action[k][i].detach().cpu()) for k in action}
@@ -175,28 +185,55 @@ def simulate(
             action = np.array(action)
         assert len(action) == len(envs)
         # step envs
-        results = [e.step(a) for e, a in zip(envs, action)]
-        results = [r() for r in results]
-        obs, reward, done = zip(*[p[:3] for p in results])
-        obs = list(obs)
-        reward = list(reward)
-        done = np.stack(done)
+        raw = [r() for r in [e.step(a) for e, a in zip(envs, action)]]
+        next_obs, reward, done, infos = [], [], [], []
+        for r in raw:
+            # Gymnasium: (obs, reward, terminated, truncated, info)
+            if len(r) == 5:
+                o, rew, term, trunc, info = r
+            # old Gym: (obs, reward, done, info)
+            elif len(r) == 4:
+                o, rew, term, info = r
+                trunc = False
+            else:
+                raise ValueError(f"Unexpected env.step() return: {r}")
+            next_obs.append(o)
+            reward.append(rew)
+            done_flag = bool(term or trunc)
+            done.append(done_flag)
+            infos.append(info)
+
+        done = np.array(done)
         episode += int(done.sum())
         length += 1
         step += len(envs)
         length *= 1 - done
-        # add to cache
-        for a, result, env in zip(action, results, envs):
-            o, r, d, info = result
-            o = {k: convert(v) for k, v in o.items()}
-            transition = o.copy()
-            if isinstance(a, dict):
-                transition.update(a)
-            else:
-                transition["action"] = a
-            transition["reward"] = r
-            transition["discount"] = info.get("discount", np.array(1 - float(d)))
-            add_to_cache(cache, env.id, transition)
+
+        # add to cache (every step transition) and update obs
+        for idx, (a, o_res, r_i, d_i, info, env) in enumerate(
+            zip(action, next_obs, reward, done, infos, envs)
+        ):
+             obs_dict = (
+                 o_res.copy() if isinstance(o_res, dict) else {"state": o_res}
+             )
+             oconv = {k: convert(v) for k, v in obs_dict.items()}
+             transition = oconv.copy()
+             if isinstance(a, dict):
+                 transition.update(a)
+             else:
+                 transition["action"] = a
+             transition["reward"]   = r_i
+             transition["discount"] = info.get("discount", np.array(1 - float(d_i)))
+             # not a new episode, and terminal flag
+             transition["is_first"]    = False
+             transition["is_terminal"] = bool(d_i)
+             add_to_cache(cache, env.id, transition)
+             # now update obs for the next agent call, including flags
+             obs[idx] = {
+                 **obs_dict,
+                 "is_first": False,
+                 "is_terminal": bool(d_i),
+             }
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -205,7 +242,7 @@ def simulate(
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"]).sum())
-                video = cache[envs[i].id]["image"]
+                video = cache[envs[i].id].get("image", None)
                 # record logs given from environments
                 for key in list(cache[envs[i].id].keys()):
                     if "log_" in key:
@@ -233,7 +270,8 @@ def simulate(
 
                     score = sum(eval_scores) / len(eval_scores)
                     length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
+                    if video is not None:
+                        logger.video(f"eval_policy", np.array(video)[None])
 
                     if len(eval_scores) >= episodes and not eval_done:
                         logger.scalar(f"eval_return", score)
@@ -374,6 +412,17 @@ def load_episodes(directory, limit=None, reverse=True):
             except Exception as e:
                 print(f"Could not load episode: {e}")
                 continue
+            # --- backfill missing episode flags for old data ---
+            L = len(episode.get("reward", []))
+            if "is_first" not in episode:
+                arr = np.zeros(L, dtype=bool)
+                if L>0: arr[0] = True
+                episode["is_first"] = arr
+            if "is_terminal" not in episode:
+                arr = np.zeros(L, dtype=bool)
+                if L>0: arr[-1] = True
+                episode["is_terminal"] = arr
+            # --- end backfill ---
             # extract only filename without extension
             episodes[str(os.path.splitext(os.path.basename(filename))[0])] = episode
             total += len(episode["reward"]) - 1

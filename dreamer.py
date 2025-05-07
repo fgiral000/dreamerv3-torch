@@ -11,11 +11,11 @@ import ruamel.yaml as yaml
 
 sys.path.append(str(pathlib.Path(__file__).parent))
 
-import exploration as expl
-import models
-import tools
-import envs.wrappers as wrappers
-from parallel import Parallel, Damy
+import dreamer_torch.dreamerv3.exploration as expl
+import dreamer_torch.dreamerv3.models as models
+import dreamer_torch.dreamerv3.tools as tools
+import dreamer_torch.dreamerv3.envs.wrappers as wrappers
+from dreamer_torch.dreamerv3.parallel import Parallel, Damy
 
 import torch
 from torch import nn
